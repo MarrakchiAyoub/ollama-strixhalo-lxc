@@ -107,6 +107,17 @@ if ! command -v pct >/dev/null 2>&1; then
 fi
 
 echo "== Sanity checks =="
+for storage_var in TEMPLATE_STORAGE ROOTFS_STORAGE; do
+  storage_id="${!storage_var}"
+  if ! pvesm status -storage "${storage_id}" >/dev/null 2>&1; then
+    echo "ERROR: storage '${storage_id}' (from \$${storage_var}) does not exist on this host." >&2
+    echo "Available storage:" >&2
+    pvesm status >&2 || true
+    echo "Set ${storage_var} to one of the names above, e.g.:" >&2
+    echo "  ${storage_var}=<name> ./02-create-gpu-lxc.sh" >&2
+    exit 1
+  fi
+done
 if [[ ! -e /dev/kfd ]]; then
   echo "ERROR: /dev/kfd not found on the HOST. The amdgpu kernel driver with" >&2
   echo "KFD (compute) support doesn't seem to be active. Check 'lsmod | grep amdgpu'" >&2
@@ -217,19 +228,31 @@ pct exec "${CTID}" -- bash -c 'ls -l /dev/kfd /dev/dri/' || {
   exit 1
 }
 
+RAW_BASE="https://raw.githubusercontent.com/MarrakchiAyoub/ollama-strixhalo-lxc/main"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ ! -f "${SCRIPT_DIR}/03-setup-ollama.sh" ]]; then
-  echo "ERROR: 03-setup-ollama.sh not found next to this script (looked in ${SCRIPT_DIR})." >&2
-  exit 1
-fi
-if [[ ! -f "${SCRIPT_DIR}/04-update-ollama.sh" ]]; then
-  echo "ERROR: 04-update-ollama.sh not found next to this script (looked in ${SCRIPT_DIR})." >&2
-  exit 1
-fi
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
 
-echo "== Copying in the Ollama/ROCm setup + update scripts =="
-pct push "${CTID}" "${SCRIPT_DIR}/03-setup-ollama.sh" /root/03-setup-ollama.sh
-pct push "${CTID}" "${SCRIPT_DIR}/04-update-ollama.sh" /root/04-update-ollama.sh
+fetch_script() {
+  local name="$1" dest="$2"
+  if [[ -f "${SCRIPT_DIR}/${name}" ]]; then
+    cp "${SCRIPT_DIR}/${name}" "${dest}"
+    return
+  fi
+  echo "  ${name} not found locally, downloading from ${RAW_BASE}/${name} ..."
+  if ! curl -fsSL "${RAW_BASE}/${name}" -o "${dest}"; then
+    echo "ERROR: failed to download ${name} from ${RAW_BASE}/${name}" >&2
+    exit 1
+  fi
+}
+
+echo "== Fetching the Ollama/ROCm setup + update scripts =="
+fetch_script "03-setup-ollama.sh" "${WORK_DIR}/03-setup-ollama.sh"
+fetch_script "04-update-ollama.sh" "${WORK_DIR}/04-update-ollama.sh"
+
+echo "== Copying them into the container =="
+pct push "${CTID}" "${WORK_DIR}/03-setup-ollama.sh" /root/03-setup-ollama.sh
+pct push "${CTID}" "${WORK_DIR}/04-update-ollama.sh" /root/04-update-ollama.sh
 pct exec "${CTID}" -- chmod +x /root/03-setup-ollama.sh /root/04-update-ollama.sh
 
 echo "== Running setup inside the container (this installs ROCm + Ollama and benchmarks it -- can take 10-20+ minutes) =="

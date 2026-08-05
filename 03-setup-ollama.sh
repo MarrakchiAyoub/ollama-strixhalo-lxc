@@ -64,7 +64,7 @@ echo "== apt update/upgrade =="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y wget curl gnupg ca-certificates lsb-release software-properties-common jq
+apt-get install -y wget curl gnupg ca-certificates lsb-release software-properties-common jq zstd
 
 # ---------------------------------------------------------------------------
 # 2. ROCm userspace (repo-based install, no kernel driver / no DKMS)
@@ -115,6 +115,12 @@ echo "render gid ${RENDER_GID} -> group '${RENDER_GROUP}'"
 # ---------------------------------------------------------------------------
 echo "== Installing Ollama =="
 curl -fsSL https://ollama.com/install.sh | sh
+
+if ! id ollama >/dev/null 2>&1 || ! systemctl list-unit-files ollama.service >/dev/null 2>&1; then
+  echo "ERROR: the Ollama installer didn't finish successfully -- no 'ollama' user and/or" >&2
+  echo "no ollama.service unit was created. Scroll up for the installer's own error." >&2
+  exit 1
+fi
 
 # Ollama's installer creates a system user "ollama" that runs the service.
 usermod -aG "${KFD_GROUP},${RENDER_GROUP}" ollama

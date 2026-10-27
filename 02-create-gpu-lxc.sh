@@ -2,12 +2,14 @@
 #
 # 02-create-gpu-lxc.sh
 #
-# Run this ON THE PROXMOX HOST as root.
+# Run this ON THE PROXMOX HOST as root. It copies 03/04/05 into the container:
+# from the files next to it if they exist (a git checkout), otherwise it
+# downloads them from the repo's main branch on raw.githubusercontent.com.
 #
 # Creates an unprivileged Ubuntu 24.04 LXC container, passes through the
 # AMD iGPU's /dev/kfd (ROCm compute) and /dev/dri/renderDxxx (DRM render)
 # device nodes, starts it, then copies in and runs 03-setup-ollama.sh to
-# install ROCm + Ollama and auto-tune it for gfx1151.
+# install ROCm + Ollama and tune it for gfx1151.
 #
 # Run 01-host-memory-tuning.sh (and reboot) FIRST if you want the GPU to be
 # able to use more than your BIOS's default small VRAM/UMA carve-out.
@@ -15,25 +17,41 @@
 # Usage:
 #   ./02-create-gpu-lxc.sh                    Create a new container (default)
 #   ./02-create-gpu-lxc.sh create             Same as above
-#   ./02-create-gpu-lxc.sh update [CTID]      Check for a newer Ollama release
-#                                              inside an existing container
-#                                              created by this script, and
-#                                              install it if there is one
-#                                              (re-benchmarks the GPU override
-#                                              too). CTID defaults to the
+#   ./02-create-gpu-lxc.sh update [CTID]      Update an existing container: first copies the
+#                                              latest 04/05 helper scripts from this repo into
+#                                              it, then checks for a newer Ollama release and
+#                                              re-runs the GPU tuning. CTID defaults to the
 #                                              CTID variable below (900).
-#   ./02-create-gpu-lxc.sh update [CTID] --force          re-benchmark even if
-#                                                          already up to date
-#   ./02-create-gpu-lxc.sh update [CTID] --skip-benchmark update the binary
-#                                                          only, skip re-tuning
+#   ./02-create-gpu-lxc.sh update [CTID] --force          re-tune even if already up to date
+#   ./02-create-gpu-lxc.sh update [CTID] --skip-benchmark update the binary only, skip re-tuning
 #
-# The actual update logic lives inside the container as /usr/local/bin/
-# ollama-update (installed by 03-setup-ollama.sh) -- this "update" mode is
-# just a convenience wrapper so you don't have to remember the pct exec
-# command. You can always run it directly instead:
+# Optional environment for tuning (create and update):
+#   BENCH_MODEL=llama3.1:70b   test GPU settings with the model you actually use (slower, but
+#                              the only test that proves YOUR model produces correct output)
+#   WITH_FLASH_ATTN=1          also test flash attention (off by default: unstable on gfx1151)
+#
+# The update/tune logic lives inside the container as /usr/local/bin/ollama-update
+# and /usr/local/bin/ollama-tune -- you can also run those directly:
 #   pct exec <CTID> -- ollama-update [--force|--skip-benchmark]
+#   pct exec <CTID> -- ollama-tune [--model NAME] [--with-flash-attn]
 
 set -euo pipefail
+
+RAW_BASE="https://raw.githubusercontent.com/MarrakchiAyoub/ollama-strixhalo-lxc/main"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
+
+# fetch_script NAME DEST: copy NAME from next to this script, else download it from GitHub.
+fetch_script() {
+  local name="$1" dest="$2"
+  if [[ -f "${SCRIPT_DIR}/${name}" ]]; then
+    cp "${SCRIPT_DIR}/${name}" "${dest}"
+    return 0
+  fi
+  echo "  ${name} not found locally, downloading from ${RAW_BASE}/${name} ..."
+  curl -fsSL "${RAW_BASE}/${name}" -o "${dest}"
+}
 
 MODE="${1:-create}"
 if [[ "${MODE}" == "update" ]]; then
@@ -52,16 +70,26 @@ if [[ "${MODE}" == "update" ]]; then
     pct start "${UPDATE_CTID}"
     sleep 5
   fi
-  if ! pct exec "${UPDATE_CTID}" -- command -v ollama-update >/dev/null 2>&1; then
-    echo "ERROR: /usr/local/bin/ollama-update isn't present in container ${UPDATE_CTID}." >&2
-    echo "That's installed by 03-setup-ollama.sh -- if this container predates it," >&2
-    echo "copy 04-update-ollama.sh in and install it manually:" >&2
-    echo "  pct push ${UPDATE_CTID} ./04-update-ollama.sh /usr/local/bin/ollama-update" >&2
-    echo "  pct exec ${UPDATE_CTID} -- chmod +x /usr/local/bin/ollama-update" >&2
-    exit 1
-  fi
+
+  # Keep the helper commands inside the container in sync with this repo
+  # (also migrates containers built from an older version of these scripts).
+  echo "== Syncing helper scripts into container ${UPDATE_CTID} =="
+  for pair in "04-update-ollama.sh:ollama-update" "05-tune-ollama.sh:ollama-tune"; do
+    name="${pair%%:*}"
+    src="${WORK_DIR}/${name}"
+    dst="/usr/local/bin/${pair##*:}"
+    if fetch_script "${name}" "${src}"; then
+      pct push "${UPDATE_CTID}" "${src}" "${dst}"
+      pct exec "${UPDATE_CTID}" -- chmod 0755 "${dst}"
+      echo "  installed ${dst}"
+    else
+      echo "  WARNING: couldn't get ${name} (not next to this script, download failed); leaving the copy inside the container as-is" >&2
+    fi
+  done
+
   echo "== Checking for an Ollama update in container ${UPDATE_CTID} =="
-  pct exec "${UPDATE_CTID}" -- ollama-update "$@"
+  pct exec "${UPDATE_CTID}" -- env BENCH_MODEL="${BENCH_MODEL:-}" WITH_FLASH_ATTN="${WITH_FLASH_ATTN:-0}" \
+    ollama-update "$@"
   exit $?
 elif [[ "${MODE}" != "create" ]]; then
   echo "Usage: $0 [create|update [CTID] [--force|--skip-benchmark]]" >&2
@@ -215,7 +243,7 @@ echo "== Starting container =="
 pct start "${CTID}"
 
 echo "Waiting for network..."
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if pct exec "${CTID}" -- getent hosts ollama.com >/dev/null 2>&1; then
     break
   fi
@@ -228,35 +256,19 @@ pct exec "${CTID}" -- bash -c 'ls -l /dev/kfd /dev/dri/' || {
   exit 1
 }
 
-RAW_BASE="https://raw.githubusercontent.com/MarrakchiAyoub/ollama-strixhalo-lxc/main"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "${WORK_DIR}"' EXIT
-
-fetch_script() {
-  local name="$1" dest="$2"
-  if [[ -f "${SCRIPT_DIR}/${name}" ]]; then
-    cp "${SCRIPT_DIR}/${name}" "${dest}"
-    return
-  fi
-  echo "  ${name} not found locally, downloading from ${RAW_BASE}/${name} ..."
-  if ! curl -fsSL "${RAW_BASE}/${name}" -o "${dest}"; then
-    echo "ERROR: failed to download ${name} from ${RAW_BASE}/${name}" >&2
+echo "== Fetching and copying in the Ollama/ROCm setup + helper scripts =="
+for f in 03-setup-ollama.sh 04-update-ollama.sh 05-tune-ollama.sh; do
+  if ! fetch_script "${f}" "${WORK_DIR}/${f}"; then
+    echo "ERROR: couldn't get ${f} (not next to this script, and download from ${RAW_BASE}/${f} failed)." >&2
     exit 1
   fi
-}
+  pct push "${CTID}" "${WORK_DIR}/${f}" "/root/${f}"
+done
+pct exec "${CTID}" -- chmod +x /root/03-setup-ollama.sh /root/04-update-ollama.sh /root/05-tune-ollama.sh
 
-echo "== Fetching the Ollama/ROCm setup + update scripts =="
-fetch_script "03-setup-ollama.sh" "${WORK_DIR}/03-setup-ollama.sh"
-fetch_script "04-update-ollama.sh" "${WORK_DIR}/04-update-ollama.sh"
-
-echo "== Copying them into the container =="
-pct push "${CTID}" "${WORK_DIR}/03-setup-ollama.sh" /root/03-setup-ollama.sh
-pct push "${CTID}" "${WORK_DIR}/04-update-ollama.sh" /root/04-update-ollama.sh
-pct exec "${CTID}" -- chmod +x /root/03-setup-ollama.sh /root/04-update-ollama.sh
-
-echo "== Running setup inside the container (this installs ROCm + Ollama and benchmarks it -- can take 10-20+ minutes) =="
+echo "== Running setup inside the container (installs ROCm + Ollama and tunes it -- can take 10-20+ minutes) =="
 pct exec "${CTID}" -- env KFD_GID="${KFD_GID}" RENDER_GID="${RENDER_GID}" RENDER_DEV="${RENDER_DEV}" \
+  BENCH_MODEL="${BENCH_MODEL:-}" WITH_FLASH_ATTN="${WITH_FLASH_ATTN:-0}" \
   bash /root/03-setup-ollama.sh
 
 echo
@@ -264,6 +276,6 @@ echo "== Done =="
 CT_IP="$(pct exec "${CTID}" -- hostname -I 2>/dev/null | awk '{print $1}')"
 echo "Container ${CTID} (${HOSTNAME}) is up at ${CT_IP:-<check pct exec ${CTID} -- hostname -I>}"
 echo "Ollama API: http://${CT_IP:-<ct-ip>}:11434"
-echo "Quick test: pct exec ${CTID} -- ollama run llama3.2:1b \"hello\""
+echo "Quick test: pct exec ${CTID} -- ollama run llama3.2:3b \"hello\""
 echo "Check for Ollama updates later with: ./02-create-gpu-lxc.sh update ${CTID}"
 echo "  (or directly: pct exec ${CTID} -- ollama-update)"

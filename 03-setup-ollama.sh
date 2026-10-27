@@ -4,7 +4,7 @@
 #
 # Runs INSIDE the Ubuntu 24.04 LXC container (script 02 copies it in and
 # runs it automatically; you can also re-run it manually inside the
-# container later, e.g. after an Ollama/ROCm update, to re-tune it).
+# container later).
 #
 # What it does:
 #   1. Installs ROCm userspace libraries (NOT the kernel driver -- the
@@ -12,28 +12,36 @@
 #      userspace runtime that talks to /dev/kfd and /dev/dri).
 #   2. Matches container groups to the host GPU device GIDs so a non-root
 #      process (Ollama's systemd service) can actually open the devices.
-#   3. Installs Ollama via the official installer.
-#   4. Benchmarks a small model under a few HSA_OVERRIDE_GFX_VERSION
-#      candidates (gfx1151 has no single stable "correct" override right
-#      now -- the fastest option, confirmed to actually run on GPU, wins)
-#      and pins whichever one wins.
+#   3. Installs Ollama via the official installer, with its settings split
+#      into systemd drop-ins:
+#        00-base.conf        listen address, keep-alive     (managed here)
+#        10-gpu-tuning.conf  HSA override + flash attention (managed by ollama-tune)
+#        20-user.conf        context length, your own tweaks (yours -- never overwritten)
+#   4. Installs the helper commands  ollama-tune (script 05)  and
+#      ollama-update (script 04), then runs ollama-tune, which tests GPU
+#      settings for CORRECT output (short + long prompt) and pins the fastest
+#      one that passes.
 #
 # Env vars (optional, passed in automatically by script 02):
-#   KFD_GID, RENDER_GID, RENDER_DEV
-# If not set, this script will try to detect them from the already
+#   KFD_GID, RENDER_GID, RENDER_DEV, BENCH_MODEL, WITH_FLASH_ATTN
+# If the GIDs aren't set, this script detects them from the already
 # passed-through /dev/kfd and /dev/dri/renderD* nodes inside the container.
 
-set -uo pipefail  # not -e: benchmark trials are allowed to fail without killing the script
+set -uo pipefail  # not -e: a failing tuning run shouldn't abort the rest of the setup
 
 ROCM_VERSION="${ROCM_VERSION:-7.2}"      # ROCm release line to track; bump if AMD has shipped newer
-BENCH_MODEL="${BENCH_MODEL:-llama3.2:1b}"
-BENCH_PROMPT="Write one short sentence about the ocean."
-HSA_CANDIDATES=("native" "11.0.0" "11.5.1")   # "native" = no override at all
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run as root inside the container." >&2
   exit 1
 fi
+
+for f in 04-update-ollama.sh 05-tune-ollama.sh; do
+  if [[ ! -f "/root/${f}" ]]; then
+    echo "ERROR: /root/${f} not found. Script 02 copies it in; if you're running 03 by hand, copy it there first." >&2
+    exit 1
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # 0. Figure out device GIDs if not passed in
@@ -111,7 +119,7 @@ echo "kfd gid ${KFD_GID} -> group '${KFD_GROUP}'"
 echo "render gid ${RENDER_GID} -> group '${RENDER_GROUP}'"
 
 # ---------------------------------------------------------------------------
-# 4. Install Ollama
+# 4. Install Ollama + its systemd drop-ins
 # ---------------------------------------------------------------------------
 echo "== Installing Ollama =="
 curl -fsSL https://ollama.com/install.sh | sh
@@ -126,162 +134,44 @@ fi
 usermod -aG "${KFD_GROUP},${RENDER_GROUP}" ollama
 
 mkdir -p /etc/systemd/system/ollama.service.d
-
-write_override() {
-  local hsa_value="$1"
-  local env_line=""
-  if [[ "${hsa_value}" != "native" ]]; then
-    env_line="Environment=\"HSA_OVERRIDE_GFX_VERSION=${hsa_value}\""
-  fi
-  cat > /etc/systemd/system/ollama.service.d/override.conf <<EOF
+cat > /etc/systemd/system/ollama.service.d/00-base.conf <<'EOF'
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0:11434"
-Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KEEP_ALIVE=10m"
-${env_line}
 EOF
-  systemctl daemon-reload
-  systemctl restart ollama
-}
-
-wait_for_ollama() {
-  local i
-  for i in $(seq 1 30); do
-    if curl -fsS http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
-echo "== Starting Ollama (native config) and pulling benchmark model ${BENCH_MODEL} =="
-write_override "native"
-if ! wait_for_ollama; then
-  echo "ERROR: Ollama service didn't come up. Check: journalctl -u ollama -n 100 --no-pager" >&2
-  exit 1
-fi
-
-if ! ollama pull "${BENCH_MODEL}"; then
-  echo "ERROR: failed to pull ${BENCH_MODEL}. Check network access from inside the container." >&2
-  exit 1
-fi
+# 10-gpu-tuning.conf is written by ollama-tune; 20-user.conf is created by it
+# on first run (context length) and is never overwritten afterwards.
 
 # ---------------------------------------------------------------------------
-# 5. Benchmark HSA_OVERRIDE_GFX_VERSION candidates
+# 5. Install the helper commands, then tune
 # ---------------------------------------------------------------------------
-echo
-echo "== Benchmarking HSA_OVERRIDE_GFX_VERSION candidates on ${BENCH_MODEL} =="
-echo "(gfx1151 support is a moving target; the fastest option confirmed to run"
-echo " on GPU -- not silently falling back to CPU -- wins and gets pinned.)"
-echo
+install -m 0755 /root/05-tune-ollama.sh /usr/local/bin/ollama-tune
+install -m 0755 /root/04-update-ollama.sh /usr/local/bin/ollama-update
+echo "Installed commands: ollama-tune, ollama-update"
 
-declare -a RESULT_NAME=()
-declare -a RESULT_RATE=()
-declare -a RESULT_GPU=()
-
-for cand in "${HSA_CANDIDATES[@]}"; do
-  echo "--- Candidate: HSA_OVERRIDE_GFX_VERSION=${cand} ---"
-  write_override "${cand}"
-  if ! wait_for_ollama; then
-    echo "  service failed to come up with this override, skipping"
-    RESULT_NAME+=("${cand}"); RESULT_RATE+=("0"); RESULT_GPU+=("no")
-    continue
-  fi
-
-  # Make sure the model isn't still resident from a previous trial so we get
-  # a clean load under this override.
-  ollama stop "${BENCH_MODEL}" >/dev/null 2>&1 || true
-  sleep 1
-
-  OUT=""
-  if OUT="$(timeout 90 ollama run "${BENCH_MODEL}" --verbose "${BENCH_PROMPT}" 2>&1)"; then
-    RATE="$(echo "${OUT}" | grep -E '^eval rate:' | awk '{print $3}' | head -n1)"
-    RATE="${RATE:-0}"
-  else
-    echo "  run timed out or crashed under this override"
-    RATE="0"
-  fi
-
-  GPU_STATUS="no"
-  PS_OUT="$(ollama ps 2>/dev/null || true)"
-  if echo "${PS_OUT}" | grep -qi "GPU"; then
-    GPU_STATUS="yes"
-  fi
-
-  echo "  eval rate: ${RATE} tokens/s   GPU used: ${GPU_STATUS}"
-  RESULT_NAME+=("${cand}")
-  RESULT_RATE+=("${RATE}")
-  RESULT_GPU+=("${GPU_STATUS}")
-done
-
-# ---------------------------------------------------------------------------
-# 6. Pick a winner and pin it
-# ---------------------------------------------------------------------------
-BEST_IDX=-1
-BEST_RATE="-1"
-for i in "${!RESULT_NAME[@]}"; do
-  if [[ "${RESULT_GPU[$i]}" == "yes" ]]; then
-    if awk -v a="${RESULT_RATE[$i]}" -v b="${BEST_RATE}" 'BEGIN{exit !(a>b)}'; then
-      BEST_RATE="${RESULT_RATE[$i]}"
-      BEST_IDX="${i}"
-    fi
-  fi
-done
-
-echo
-echo "== Results =="
-printf "%-10s %12s %8s\n" "override" "tokens/s" "on GPU"
-for i in "${!RESULT_NAME[@]}"; do
-  printf "%-10s %12s %8s\n" "${RESULT_NAME[$i]}" "${RESULT_RATE[$i]}" "${RESULT_GPU[$i]}"
-done
-echo
-
-if [[ "${BEST_IDX}" -eq -1 ]]; then
-  echo "WARNING: none of the candidates were confirmed running on GPU." >&2
-  echo "Falling back to whichever had the highest raw tokens/s, but this needs" >&2
-  echo "manual investigation -- the GPU is probably not being used at all." >&2
-  echo "Diagnostics:" >&2
-  rocminfo 2>&1 | grep -A3 -i "gfx" >&2 || true
-  echo "--- last 40 lines of ollama journal ---" >&2
-  journalctl -u ollama -n 40 --no-pager >&2 || true
-  for i in "${!RESULT_NAME[@]}"; do
-    if awk -v a="${RESULT_RATE[$i]}" -v b="${BEST_RATE}" 'BEGIN{exit !(a>b)}'; then
-      BEST_RATE="${RESULT_RATE[$i]}"
-      BEST_IDX="${i}"
-    fi
-  done
-fi
-
-WINNER="${RESULT_NAME[$BEST_IDX]}"
-echo "Winner: HSA_OVERRIDE_GFX_VERSION=${WINNER} (${RESULT_RATE[$BEST_IDX]} tokens/s, GPU used: ${RESULT_GPU[$BEST_IDX]})"
-write_override "${WINNER}"
-wait_for_ollama || true
+systemctl daemon-reload
 systemctl enable ollama >/dev/null 2>&1 || true
+systemctl restart ollama
 
-# ---------------------------------------------------------------------------
-# 7. Install the "ollama-update" command
-# ---------------------------------------------------------------------------
-# 04-update-ollama.sh checks for a newer Ollama release, installs it, and
-# re-runs this same benchmark, so the pinned HSA_OVERRIDE_GFX_VERSION stays
-# correct as new Ollama/ROCm builds ship. It's copied in by script 02 right
-# alongside this one.
-if [[ -f /root/04-update-ollama.sh ]]; then
-  install -m 0755 /root/04-update-ollama.sh /usr/local/bin/ollama-update
-  echo "Installed update command: ollama-update"
-else
-  echo "NOTE: /root/04-update-ollama.sh wasn't found, so the 'ollama-update' command" >&2
-  echo "wasn't installed. Copy it in and install manually if you want it:" >&2
-  echo "  pct push <CTID> ./04-update-ollama.sh /usr/local/bin/ollama-update" >&2
-  echo "  pct exec <CTID> -- chmod +x /usr/local/bin/ollama-update" >&2
-fi
+echo
+echo "== Tuning GPU settings (this loads a test model several times; allow a few minutes) =="
+ollama-tune
+TUNE_RC=$?
 
 echo
 echo "== Setup complete =="
-echo "Pinned config: /etc/systemd/system/ollama.service.d/override.conf"
-cat /etc/systemd/system/ollama.service.d/override.conf
+echo "Settings files in /etc/systemd/system/ollama.service.d/:"
+for f in /etc/systemd/system/ollama.service.d/*.conf; do
+  echo "--- $(basename "${f}") ---"
+  cat "${f}"
+done
 echo
-echo "Try it: ollama run ${BENCH_MODEL} \"tell me a fact about the ocean\""
-echo "Check GPU offload any time with: ollama ps"
-echo "Check for a newer Ollama release any time with: ollama-update"
+echo "Check GPU offload any time with:    ollama ps"
+echo "Re-verify GPU settings with:        ollama-tune   (add --model <your-model> to test the model you actually use)"
+echo "Check for a newer Ollama with:      ollama-update"
 echo "  (or from the host: ./02-create-gpu-lxc.sh update <CTID>)"
+if [[ "${TUNE_RC}" -ne 0 ]]; then
+  echo
+  echo "NOTE: ollama-tune found no configuration that produced correct output -- see its warning above." >&2
+fi
+exit "${TUNE_RC}"

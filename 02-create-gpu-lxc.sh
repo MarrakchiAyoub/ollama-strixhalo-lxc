@@ -7,7 +7,8 @@
 # Creates an unprivileged Ubuntu 24.04 LXC container, passes through the
 # AMD iGPU's /dev/kfd (ROCm compute) and /dev/dri/renderDxxx (DRM render)
 # device nodes, starts it, then copies in and runs 03-setup-ollama.sh to
-# install ROCm + Ollama and auto-tune it for gfx1151.
+# install Ollama and configure it to use the Vulkan GPU backend (ROCm
+# corrupts long prompts on gfx1151 -- see 03-setup-ollama.sh).
 #
 # Run 01-host-memory-tuning.sh (and reboot) FIRST if you want the GPU to be
 # able to use more than your BIOS's default small VRAM/UMA carve-out.
@@ -18,20 +19,17 @@
 #   ./02-create-gpu-lxc.sh update [CTID]      Check for a newer Ollama release
 #                                              inside an existing container
 #                                              created by this script, and
-#                                              install it if there is one
-#                                              (re-benchmarks the GPU override
-#                                              too). CTID defaults to the
-#                                              CTID variable below (900).
-#   ./02-create-gpu-lxc.sh update [CTID] --force          re-benchmark even if
+#                                              install it if there is one. CTID
+#                                              defaults to the CTID variable
+#                                              below (900).
+#   ./02-create-gpu-lxc.sh update [CTID] --force          reinstall even if
 #                                                          already up to date
-#   ./02-create-gpu-lxc.sh update [CTID] --skip-benchmark update the binary
-#                                                          only, skip re-tuning
 #
 # The actual update logic lives inside the container as /usr/local/bin/
 # ollama-update (installed by 03-setup-ollama.sh) -- this "update" mode is
 # just a convenience wrapper so you don't have to remember the pct exec
 # command. You can always run it directly instead:
-#   pct exec <CTID> -- ollama-update [--force|--skip-benchmark]
+#   pct exec <CTID> -- ollama-update [--force]
 
 set -euo pipefail
 
@@ -64,7 +62,7 @@ if [[ "${MODE}" == "update" ]]; then
   pct exec "${UPDATE_CTID}" -- ollama-update "$@"
   exit $?
 elif [[ "${MODE}" != "create" ]]; then
-  echo "Usage: $0 [create|update [CTID] [--force|--skip-benchmark]]" >&2
+  echo "Usage: $0 [create|update [CTID] [--force]]" >&2
   exit 1
 fi
 
@@ -255,7 +253,7 @@ pct push "${CTID}" "${WORK_DIR}/03-setup-ollama.sh" /root/03-setup-ollama.sh
 pct push "${CTID}" "${WORK_DIR}/04-update-ollama.sh" /root/04-update-ollama.sh
 pct exec "${CTID}" -- chmod +x /root/03-setup-ollama.sh /root/04-update-ollama.sh
 
-echo "== Running setup inside the container (this installs ROCm + Ollama and benchmarks it -- can take 10-20+ minutes) =="
+echo "== Running setup inside the container (installs the GPU userspace libs + Ollama -- can take 10+ minutes) =="
 pct exec "${CTID}" -- env KFD_GID="${KFD_GID}" RENDER_GID="${RENDER_GID}" RENDER_DEV="${RENDER_DEV}" \
   bash /root/03-setup-ollama.sh
 

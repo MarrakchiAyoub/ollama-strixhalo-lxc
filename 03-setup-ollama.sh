@@ -4,31 +4,42 @@
 #
 # Runs INSIDE the Ubuntu 24.04 LXC container (script 02 copies it in and
 # runs it automatically; you can also re-run it manually inside the
-# container later, e.g. after an Ollama/ROCm update, to re-tune it).
+# container later to re-apply the settings below).
 #
 # What it does:
-#   1. Installs ROCm userspace libraries (NOT the kernel driver -- the
-#      Proxmox host already provides that; the container just needs the
-#      userspace runtime that talks to /dev/kfd and /dev/dri).
+#   1. Installs the ROCm userspace libraries (NOT the kernel driver -- the
+#      Proxmox host already provides that) plus the Mesa Vulkan driver (RADV).
 #   2. Matches container groups to the host GPU device GIDs so a non-root
 #      process (Ollama's systemd service) can actually open the devices.
-#   3. Installs Ollama via the official installer.
-#   4. Benchmarks a small model under a few HSA_OVERRIDE_GFX_VERSION
-#      candidates (gfx1151 has no single stable "correct" override right
-#      now -- the fastest option, confirmed to actually run on GPU, wins)
-#      and pins whichever one wins.
+#   3. Installs Ollama via the official installer and configures it to use
+#      the VULKAN backend, through systemd drop-ins:
+#        00-base.conf   listen address, keep-alive        (rewritten by this script)
+#        10-gpu.conf    Vulkan backend, flash attention off (rewritten by this script)
+#        20-user.conf   context length, your own tweaks     (yours -- created once, never overwritten)
+#
+# Why Vulkan and not ROCm: on gfx1151 with Linux 6.17 (Proxmox VE 9.1), Ollama's
+# ROCm backend corrupts long prompts -- short prompts are fine, but anything past
+# a few thousand tokens (e.g. Open WebUI's hidden tool definitions) turns into word
+# salad, on every model size tried, with flash attention on or off. The Vulkan
+# backend gives correct output. AMD's docs want Linux >= 6.18.4 for gfx1151, so
+# ROCm may work again after a host kernel upgrade.
+#
+# Trade-offs of Vulkan here: roughly 45% slower prompt processing than ROCm, and
+# the GPU can address ~64 GiB instead of ~107 GiB.
 #
 # Env vars (optional, passed in automatically by script 02):
 #   KFD_GID, RENDER_GID, RENDER_DEV
 # If not set, this script will try to detect them from the already
 # passed-through /dev/kfd and /dev/dri/renderD* nodes inside the container.
+#   CONTEXT_LENGTH   default context for new installs (default 32768). Always set
+#                    explicitly: left on auto, Ollama picks the model's full 131072
+#                    for llama3.1, which does not fit and crashes the GPU driver.
 
-set -uo pipefail  # not -e: benchmark trials are allowed to fail without killing the script
+set -uo pipefail  # not -e: the final backend check only warns
 
 ROCM_VERSION="${ROCM_VERSION:-7.2}"      # ROCm release line to track; bump if AMD has shipped newer
-BENCH_MODEL="${BENCH_MODEL:-llama3.2:1b}"
-BENCH_PROMPT="Write one short sentence about the ocean."
-HSA_CANDIDATES=("native" "11.0.0" "11.5.1")   # "native" = no override at all
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
+DROPIN_DIR=/etc/systemd/system/ollama.service.d
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run as root inside the container." >&2
@@ -58,13 +69,14 @@ RENDER_GID="${RENDER_GID:-$(stat -c '%g' "${RENDER_DEV}")}"
 echo "== Using /dev/kfd (gid ${KFD_GID}) and ${RENDER_DEV} (gid ${RENDER_GID}) =="
 
 # ---------------------------------------------------------------------------
-# 1. Base packages
+# 1. Base packages (incl. the Vulkan driver and vulkaninfo)
 # ---------------------------------------------------------------------------
 echo "== apt update/upgrade =="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y wget curl gnupg ca-certificates lsb-release software-properties-common jq zstd
+apt-get install -y wget curl gnupg ca-certificates lsb-release software-properties-common jq zstd \
+  mesa-vulkan-drivers vulkan-tools
 
 # ---------------------------------------------------------------------------
 # 2. ROCm userspace (repo-based install, no kernel driver / no DKMS)
@@ -111,7 +123,7 @@ echo "kfd gid ${KFD_GID} -> group '${KFD_GROUP}'"
 echo "render gid ${RENDER_GID} -> group '${RENDER_GROUP}'"
 
 # ---------------------------------------------------------------------------
-# 4. Install Ollama
+# 4. Install Ollama + its systemd drop-ins
 # ---------------------------------------------------------------------------
 echo "== Installing Ollama =="
 curl -fsSL https://ollama.com/install.sh | sh
@@ -125,24 +137,46 @@ fi
 # Ollama's installer creates a system user "ollama" that runs the service.
 usermod -aG "${KFD_GROUP},${RENDER_GROUP}" ollama
 
-mkdir -p /etc/systemd/system/ollama.service.d
+mkdir -p "${DROPIN_DIR}"
 
-write_override() {
-  local hsa_value="$1"
-  local env_line=""
-  if [[ "${hsa_value}" != "native" ]]; then
-    env_line="Environment=\"HSA_OVERRIDE_GFX_VERSION=${hsa_value}\""
-  fi
-  cat > /etc/systemd/system/ollama.service.d/override.conf <<EOF
+# Older versions of these scripts wrote everything into override.conf, including
+# a forced flash attention and a benchmarked HSA override. It sorts AFTER the
+# files below, so left in place it would silently override them. Move it aside
+# (the new name doesn't end in .conf, so systemd ignores it).
+if [[ -f "${DROPIN_DIR}/override.conf" ]]; then
+  backup="${DROPIN_DIR}/override.conf.bak-$(date +%s)"
+  mv "${DROPIN_DIR}/override.conf" "${backup}"
+  echo "Moved the old ${DROPIN_DIR}/override.conf to ${backup}"
+fi
+
+cat > "${DROPIN_DIR}/00-base.conf" <<'EOF'
+# Managed by 03-setup-ollama.sh (rewritten on every run). Put your own settings in 20-user.conf.
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0:11434"
-Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KEEP_ALIVE=10m"
-${env_line}
 EOF
-  systemctl daemon-reload
-  systemctl restart ollama
-}
+
+cat > "${DROPIN_DIR}/10-gpu.conf" <<'EOF'
+# Managed by 03-setup-ollama.sh (rewritten on every run). Put your own settings in 20-user.conf.
+# Vulkan backend: the ROCm backend produces garbled output on long prompts on gfx1151.
+# OLLAMA_IGPU_ENABLE: without it Ollama ignores the iGPU and silently runs on CPU.
+# Flash attention off: untested with Vulkan here, and unstable on gfx1151 in general.
+[Service]
+Environment="OLLAMA_LLM_LIBRARY=vulkan"
+Environment="OLLAMA_IGPU_ENABLE=1"
+Environment="OLLAMA_FLASH_ATTENTION=0"
+EOF
+
+if [[ ! -f "${DROPIN_DIR}/20-user.conf" ]]; then
+  cat > "${DROPIN_DIR}/20-user.conf" <<EOF
+# Your own Ollama settings. 03-setup-ollama.sh and ollama-update never overwrite this file.
+# Always set a context length: on auto, Ollama picks 131072 for llama3.1, which does not
+# fit in the GPU's ~64 GiB and crashes the driver. Raise it only if the model + KV cache fit.
+[Service]
+Environment="OLLAMA_CONTEXT_LENGTH=${CONTEXT_LENGTH}"
+EOF
+  echo "Created ${DROPIN_DIR}/20-user.conf (context length ${CONTEXT_LENGTH}) -- edit it to taste."
+fi
 
 wait_for_ollama() {
   local i
@@ -155,117 +189,33 @@ wait_for_ollama() {
   return 1
 }
 
-echo "== Starting Ollama (native config) and pulling benchmark model ${BENCH_MODEL} =="
-write_override "native"
+systemctl daemon-reload
+systemctl enable ollama >/dev/null 2>&1 || true
+systemctl restart ollama
 if ! wait_for_ollama; then
   echo "ERROR: Ollama service didn't come up. Check: journalctl -u ollama -n 100 --no-pager" >&2
   exit 1
 fi
 
-if ! ollama pull "${BENCH_MODEL}"; then
-  echo "ERROR: failed to pull ${BENCH_MODEL}. Check network access from inside the container." >&2
-  exit 1
+echo "== Checking the Vulkan backend =="
+if ! vulkaninfo --summary 2>/dev/null | grep -qi "radv"; then
+  echo "WARNING: vulkaninfo doesn't list a RADV (Mesa AMD) device. Ollama will fall back to CPU." >&2
+  echo "Check: vulkaninfo --summary   and that the ollama user is in the render group." >&2
+fi
+BACKEND_LINE="$(journalctl -u ollama --since '-2min' --no-pager 2>/dev/null | grep 'inference compute' | tail -n1)"
+if [[ "${BACKEND_LINE}" == *"library=Vulkan"* ]]; then
+  echo "Ollama is using the Vulkan GPU backend."
+else
+  echo "WARNING: couldn't confirm library=Vulkan in the Ollama journal. Check:" >&2
+  echo "  journalctl -u ollama --no-pager | grep 'inference compute'" >&2
+  echo "  (last line seen: ${BACKEND_LINE:-none})" >&2
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Benchmark HSA_OVERRIDE_GFX_VERSION candidates
+# 5. Install the "ollama-update" command
 # ---------------------------------------------------------------------------
-echo
-echo "== Benchmarking HSA_OVERRIDE_GFX_VERSION candidates on ${BENCH_MODEL} =="
-echo "(gfx1151 support is a moving target; the fastest option confirmed to run"
-echo " on GPU -- not silently falling back to CPU -- wins and gets pinned.)"
-echo
-
-declare -a RESULT_NAME=()
-declare -a RESULT_RATE=()
-declare -a RESULT_GPU=()
-
-for cand in "${HSA_CANDIDATES[@]}"; do
-  echo "--- Candidate: HSA_OVERRIDE_GFX_VERSION=${cand} ---"
-  write_override "${cand}"
-  if ! wait_for_ollama; then
-    echo "  service failed to come up with this override, skipping"
-    RESULT_NAME+=("${cand}"); RESULT_RATE+=("0"); RESULT_GPU+=("no")
-    continue
-  fi
-
-  # Make sure the model isn't still resident from a previous trial so we get
-  # a clean load under this override.
-  ollama stop "${BENCH_MODEL}" >/dev/null 2>&1 || true
-  sleep 1
-
-  OUT=""
-  if OUT="$(timeout 90 ollama run "${BENCH_MODEL}" --verbose "${BENCH_PROMPT}" 2>&1)"; then
-    RATE="$(echo "${OUT}" | grep -E '^eval rate:' | awk '{print $3}' | head -n1)"
-    RATE="${RATE:-0}"
-  else
-    echo "  run timed out or crashed under this override"
-    RATE="0"
-  fi
-
-  GPU_STATUS="no"
-  PS_OUT="$(ollama ps 2>/dev/null || true)"
-  if echo "${PS_OUT}" | grep -qi "GPU"; then
-    GPU_STATUS="yes"
-  fi
-
-  echo "  eval rate: ${RATE} tokens/s   GPU used: ${GPU_STATUS}"
-  RESULT_NAME+=("${cand}")
-  RESULT_RATE+=("${RATE}")
-  RESULT_GPU+=("${GPU_STATUS}")
-done
-
-# ---------------------------------------------------------------------------
-# 6. Pick a winner and pin it
-# ---------------------------------------------------------------------------
-BEST_IDX=-1
-BEST_RATE="-1"
-for i in "${!RESULT_NAME[@]}"; do
-  if [[ "${RESULT_GPU[$i]}" == "yes" ]]; then
-    if awk -v a="${RESULT_RATE[$i]}" -v b="${BEST_RATE}" 'BEGIN{exit !(a>b)}'; then
-      BEST_RATE="${RESULT_RATE[$i]}"
-      BEST_IDX="${i}"
-    fi
-  fi
-done
-
-echo
-echo "== Results =="
-printf "%-10s %12s %8s\n" "override" "tokens/s" "on GPU"
-for i in "${!RESULT_NAME[@]}"; do
-  printf "%-10s %12s %8s\n" "${RESULT_NAME[$i]}" "${RESULT_RATE[$i]}" "${RESULT_GPU[$i]}"
-done
-echo
-
-if [[ "${BEST_IDX}" -eq -1 ]]; then
-  echo "WARNING: none of the candidates were confirmed running on GPU." >&2
-  echo "Falling back to whichever had the highest raw tokens/s, but this needs" >&2
-  echo "manual investigation -- the GPU is probably not being used at all." >&2
-  echo "Diagnostics:" >&2
-  rocminfo 2>&1 | grep -A3 -i "gfx" >&2 || true
-  echo "--- last 40 lines of ollama journal ---" >&2
-  journalctl -u ollama -n 40 --no-pager >&2 || true
-  for i in "${!RESULT_NAME[@]}"; do
-    if awk -v a="${RESULT_RATE[$i]}" -v b="${BEST_RATE}" 'BEGIN{exit !(a>b)}'; then
-      BEST_RATE="${RESULT_RATE[$i]}"
-      BEST_IDX="${i}"
-    fi
-  done
-fi
-
-WINNER="${RESULT_NAME[$BEST_IDX]}"
-echo "Winner: HSA_OVERRIDE_GFX_VERSION=${WINNER} (${RESULT_RATE[$BEST_IDX]} tokens/s, GPU used: ${RESULT_GPU[$BEST_IDX]})"
-write_override "${WINNER}"
-wait_for_ollama || true
-systemctl enable ollama >/dev/null 2>&1 || true
-
-# ---------------------------------------------------------------------------
-# 7. Install the "ollama-update" command
-# ---------------------------------------------------------------------------
-# 04-update-ollama.sh checks for a newer Ollama release, installs it, and
-# re-runs this same benchmark, so the pinned HSA_OVERRIDE_GFX_VERSION stays
-# correct as new Ollama/ROCm builds ship. It's copied in by script 02 right
-# alongside this one.
+# 04-update-ollama.sh checks for a newer Ollama release and installs it. It's
+# copied in by script 02 right alongside this one.
 if [[ -f /root/04-update-ollama.sh ]]; then
   install -m 0755 /root/04-update-ollama.sh /usr/local/bin/ollama-update
   echo "Installed update command: ollama-update"
@@ -278,10 +228,13 @@ fi
 
 echo
 echo "== Setup complete =="
-echo "Pinned config: /etc/systemd/system/ollama.service.d/override.conf"
-cat /etc/systemd/system/ollama.service.d/override.conf
+echo "Settings files in ${DROPIN_DIR}/:"
+for f in "${DROPIN_DIR}"/*.conf; do
+  echo "--- $(basename "${f}") ---"
+  cat "${f}"
+done
 echo
-echo "Try it: ollama run ${BENCH_MODEL} \"tell me a fact about the ocean\""
-echo "Check GPU offload any time with: ollama ps"
-echo "Check for a newer Ollama release any time with: ollama-update"
+echo "Try it:                  ollama run llama3.2:3b \"tell me a fact about the ocean\""
+echo "Check GPU offload with:  ollama ps"
+echo "Update Ollama with:      ollama-update"
 echo "  (or from the host: ./02-create-gpu-lxc.sh update <CTID>)"

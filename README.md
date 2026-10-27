@@ -4,10 +4,9 @@ Your community-script LXC was almost certainly running Ollama on **CPU only**,
 copying the whole model into container RAM and grinding through it with no
 GPU acceleration at all — that's the "uses tons of RAM and is still slow"
 symptom. These scripts fix that by passing the Radeon 8060S iGPU straight
-into an unprivileged LXC container and installing a ROCm build that actually
-targets `gfx1151` (Strix Halo's GPU ISA), plus an auto-tuning step, because
-the correct config for this specific chip is still a moving target across
-kernel/ROCm/Ollama versions.
+into an unprivileged LXC container and running Ollama on its **Vulkan**
+backend, because the correct config for this specific chip (`gfx1151`) is
+still a moving target across kernel/ROCm/Ollama versions.
 
 ## Why this needs a custom approach
 
@@ -15,17 +14,18 @@ Strix Halo has no dedicated VRAM — it carves "VRAM" out of your system RAM
 (GTT/unified memory), and `gfx1151` support is very recent and still rough
 around the edges in the AMD/Ollama software stack:
 
-- Official Ollama release binaries **bundle their own minimal ROCm runtime**
-  and, as of this writing, that bundled runtime doesn't recognize `gfx1151`.
-  It works anyway once you set `HSA_OVERRIDE_GFX_VERSION` to make Ollama
-  treat the GPU as an older, already-supported RDNA3 chip (`gfx1100`).
-  Confusingly, several independent benchmarks show the **spoofed gfx1100
-  path is currently faster** than the "correct" native gfx1151 kernels
-  because AMD's gfx1151 kernels are still under-optimized. There is no
-  single "right" override value that stays right for long, so script `03`
-  benchmarks a few candidates on your actual hardware and keeps the fastest
-  one that's actually confirmed to run on GPU (not silently falling back to
-  CPU).
+- **Ollama's ROCm backend corrupts long prompts on `gfx1151`** (tested with
+  Ollama 0.32.5, ROCm 7.2, Proxmox kernel 6.17). Short prompts are fine, but
+  anything past a few thousand tokens turns into word salad, on every model
+  size tried (8B and 70B), with flash attention on or off. The **Vulkan**
+  backend (Mesa RADV) gives correct output, so script `03` configures
+  Ollama to use it. Trade-offs: roughly 45% slower prompt processing than
+  ROCm, and the GPU can address ~64 GiB through Vulkan instead of ~107 GiB.
+  Revisit ROCm after a host kernel upgrade (see "Known trade-offs").
+- **Always set a context length.** Left on auto, Ollama picks the model's
+  full 131072 context for llama3.1, which needs a ~40 GB KV cache, doesn't
+  fit in the GPU, and crashes the driver (`ErrorDeviceLost`). Script `03`
+  sets 32768 in `20-user.conf`.
 - LXC (not a VM) is the correct container type here: since an LXC shares the
   host kernel, you just hand it the `/dev/kfd` and `/dev/dri/renderDxxx`
   device nodes — no VFIO/IOMMU GPU passthrough, no splitting the GPU away
@@ -45,13 +45,32 @@ around the edges in the AMD/Ollama software stack:
 |---|---|---|---|
 | `01-host-memory-tuning.sh` | Proxmox host, as root | Yes (you choose when) | Checks host kernel version, raises the GTT/TTM memory pool so the GPU can address more of your RAM as "VRAM", enables IOMMU passthrough mode. **Optional but recommended** — skip it and the GPU is capped at whatever your BIOS's small default UMA/VRAM split allows. |
 | `02-create-gpu-lxc.sh` | Proxmox host, as root | No | Creates an unprivileged Ubuntu 24.04 LXC, detects your GPU's actual device nodes/GIDs, wires up `/dev/kfd` + `/dev/dri/renderDxxx` passthrough, starts the container, and hands off to script 03 automatically. |
-| `03-setup-ollama.sh` | Auto-copied into the container and run by script 02 (or run manually inside the CT later) | No | Installs ROCm userspace libs (not the kernel driver — the host already has that), installs Ollama, matches container groups to the host's device GIDs, then **benchmarks a few `HSA_OVERRIDE_GFX_VERSION` candidates on a tiny model** and keeps whichever one is both fastest and confirmed running on GPU. Also installs the `ollama-update` command (script 04) into the container. |
-| `04-update-ollama.sh` | Auto-copied in by script 02/03, ends up installed inside the container as `/usr/local/bin/ollama-update` | No | Checks whether a newer Ollama release exists; if so, installs it, restarts the service, and **re-runs the same benchmark** (a new Ollama build can ship an updated bundled ROCm runtime, which can change which override value wins). |
+| `03-setup-ollama.sh` | Auto-copied into the container and run by script 02 (or run manually inside the CT later) | No | Installs the ROCm userspace libs (not the kernel driver — the host already has that) and the Mesa Vulkan driver, installs Ollama, matches container groups to the host's device GIDs, and configures Ollama for the **Vulkan backend** with a fixed context length (see "Settings files"). Also installs the `ollama-update` command (script 04) into the container. |
+| `04-update-ollama.sh` | Auto-copied in by script 02/03, ends up installed inside the container as `/usr/local/bin/ollama-update` | No | Checks whether a newer Ollama release exists; if so, installs it and restarts the service. Your settings files are left alone. |
 
 Run them in order: `01` (optional, reboot when it tells you to), then `02`
 (which calls `03` for you at the end, and `03` installs `04` as the
 `ollama-update` command). You can re-run `03` by itself later — inside the
 container — any time you want to redo the full setup.
+
+## Settings files
+
+Ollama's settings live in systemd drop-ins in `/etc/systemd/system/ollama.service.d/`:
+
+| File | Owner | Contents |
+|---|---|---|
+| `00-base.conf` | script 03 (rewritten on each run) | listen address, keep-alive |
+| `10-gpu.conf` | script 03 (rewritten on each run) | `OLLAMA_LLM_LIBRARY=vulkan`, `OLLAMA_IGPU_ENABLE=1`, `OLLAMA_FLASH_ATTENTION=0` |
+| `20-user.conf` | **you** (created once, never overwritten) | `OLLAMA_CONTEXT_LENGTH` and anything else you want |
+
+Edit `20-user.conf`, then `systemctl daemon-reload && systemctl restart ollama`.
+A leftover `override.conf` from an older version of these scripts is moved aside
+(to `override.conf.bak-<timestamp>`) when you re-run `03`, because it sorts after
+the files above and would override them.
+
+**Already have a container built with the old scripts?** Re-run `03` inside it
+(copy the latest one in with `pct push`, then `pct exec <CTID> -- bash /root/03-setup-ollama.sh`).
+Your models are kept.
 
 ## Keeping Ollama up to date
 
@@ -66,14 +85,11 @@ whichever of these is convenient:
 pct exec <CTID> -- ollama-update
 ```
 
-If a new version is out, it installs it, restarts the service, and
-re-benchmarks the `HSA_OVERRIDE_GFX_VERSION` candidates (since a new build
-can change which one is fastest / actually GPU-backed), then re-pins the
-winner. If you're already current, it does nothing. Useful flags:
+If a new version is out, it installs it and restarts the service. If you're
+already current, it does nothing. Useful flag:
 
 ```bash
-pct exec <CTID> -- ollama-update --force            # re-benchmark even if already current
-pct exec <CTID> -- ollama-update --skip-benchmark    # just bump the version, skip re-tuning
+pct exec <CTID> -- ollama-update --force            # reinstall even if already current
 ```
 
 If you want this to happen automatically instead of on-demand, add a weekly
@@ -120,18 +136,44 @@ homelab box, worth knowing about before enabling on something in active use.
 
 ## Verifying it worked
 
-Script `03` prints a summary table at the end, but you can re-check anytime
-from inside the container:
+Script `03` prints the settings it wrote and warns if it can't confirm the
+Vulkan backend, but you can re-check anytime from the host:
 
 ```bash
-pct exec <CTID> -- rocminfo | grep -A2 gfx        # GPU should be listed
-pct exec <CTID> -- ollama ps                       # PROCESSOR column should say "100% GPU"
-pct exec <CTID> -- ollama run llama3.2:1b "hello"  # should feel fast (~40-100+ tok/s range for small models, not the crawl you had before)
+pct exec <CTID> -- vulkaninfo --summary                              # should list the Radeon 8060S (RADV)
+pct exec <CTID> -- bash -c "journalctl -u ollama --no-pager | grep 'inference compute' | tail -1"   # should say library=Vulkan
+pct exec <CTID> -- ollama ps                                         # PROCESSOR column should say "100% GPU"
+pct exec <CTID> -- ollama run llama3.2:1b "hello"                    # should feel fast
 ```
 
-If `ollama ps` ever shows `100% CPU` again after a future Ollama/ROCm
-update, re-run `03-setup-ollama.sh` inside the container to re-benchmark and
-re-pin the override.
+If `ollama ps` shows `100% CPU` or the journal doesn't say `library=Vulkan`,
+check that `20-user.conf`/`10-gpu.conf` are intact and that
+`OLLAMA_IGPU_ENABLE=1` is set — without it Ollama silently ignores the iGPU.
+
+## Troubleshooting
+
+**Garbled / word-salad output on longer prompts.** Reproduce it without any UI:
+
+```bash
+pct exec <CTID> -- ollama run <model> "Hello"                       # short prompt
+pct exec <CTID> -- bash -c '(for i in $(seq 1 300); do echo "The quick brown fox jumps over the lazy dog near the river, sentence $i."; done; echo; echo "Question: which animal jumps over the dog? Answer in one short sentence.") | ollama run <model>'
+```
+
+If the short one is fine and the long one is garbage, Ollama is on the ROCm
+backend: check `10-gpu.conf` and that no other drop-in overrides
+`OLLAMA_LLM_LIBRARY`.
+
+**Open WebUI sends thousands of hidden tokens for "Hello".** Recent Open WebUI
+versions enable *native tool calling* and attach built-in tool definitions to
+every request (~5k tokens in one export), which at Vulkan prompt speeds
+(~70 tokens/s on a 70B) costs about a minute per message and makes any
+long-prompt problem show up immediately. Edit the model → Capabilities → turn
+off **Builtin Tools**. You can confirm with `prompt_eval_count` in the usage
+data: it should be tens of tokens for "Hello", not thousands.
+
+**Model crashes at load or the driver dies (`ErrorDeviceLost`).** Usually the
+context is too large for the ~64 GiB the GPU can address through Vulkan.
+Lower `OLLAMA_CONTEXT_LENGTH` in `20-user.conf`.
 
 ## Known trade-offs / things that may need hand-tuning
 
@@ -145,13 +187,11 @@ re-pin the override.
   unstable on this stack per current community reports. If you plan to run
   very long contexts, keep an eye on `journalctl -u ollama -f` for crashes
   and consider capping `num_ctx`.
-- **Vulkan is a viable alternative backend** for short-context workloads —
-  some benchmarks show Vulkan (via `llama.cpp`'s RADV path) beating ROCm on
-  prompt processing, while ROCm+rocWMMA wins on long-context generation.
-  This setup uses ROCm because it's what Ollama supports natively; if you
-  want to experiment with Vulkan-backed `llama.cpp` as well, that's a
-  separate, non-ROCm build — ask and I can put together a script for that
-  too.
+- **This setup uses Vulkan, not ROCm,** because Ollama's ROCm backend produced
+  garbled output on long prompts here (see "Why this needs a custom
+  approach"). If you upgrade the host kernel (≥ 6.18.4), ROCm may work again;
+  to test it, remove the `OLLAMA_LLM_LIBRARY` line from `10-gpu.conf` and run
+  the long-prompt repro under "Troubleshooting" before relying on it.
 
 ## Sources used while building this
 
